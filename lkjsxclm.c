@@ -3,29 +3,24 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PARAM_SIZE (1024 * 1024 * 16)
-#define TRAIN_SIZE (1024 * 16)
-#define IO_SIZE (1024 * 16)
-#define LAYER_SIZE (512)
-#define TRAIN_COUNT 100
-#define MUTATION_RATE 0.00001
+#define IO_BYTESIZE 256
+#define MEMORY_BYTESIZE 256
+#define LAYER_BITSIZE ((IO_BYTESIZE + MEMORY_BYTESIZE) * 8)
+#define PARAM_BITSIZE (LAYER_BITSIZE * LAYER_BITSIZE * 2)
+#define TRAIN_BITSIZE (1024 * 1024 * 8)
 #define RANDOM_SEED 1
-#define GEN_COUNT 10
 
-typedef enum {
-    RESULT_OK,
-    RESULT_ERR,
-} result_t;
+uint64_t best_param[PARAM_BITSIZE / 64];
+uint8_t train1[TRAIN_BITSIZE / 8];
+uint8_t train2[TRAIN_BITSIZE / 8];
+int64_t best_score = 0;
 
-int8_t param_corrent_data[PARAM_SIZE];
-int8_t param_best_data[PARAM_SIZE];
-int8_t layer_data[LAYER_SIZE * 2];
-char train_data[TRAIN_SIZE];
-char io_data[IO_SIZE];
-
-int8_t* layer1 = layer_data;
-int8_t* layer2 = layer_data + LAYER_SIZE;
-
+uint64_t param[PARAM_BITSIZE / 64];
+uint64_t layer_data[LAYER_BITSIZE / 64 * 2];
+uint64_t* layer1_u64 = layer_data;
+uint64_t* layer2_u64 = layer_data + LAYER_BITSIZE / 64;
+uint8_t* layer1_u8 = (uint8_t*)(layer_data);
+uint8_t* layer2_u8 = (uint8_t*)(layer_data + LAYER_BITSIZE / 64);
 uint64_t rd = RANDOM_SEED;
 
 uint64_t xorshift64(uint64_t x) {
@@ -35,133 +30,58 @@ uint64_t xorshift64(uint64_t x) {
     return x;
 }
 
-void param_randomize() {
-    for (int i = 0; i < PARAM_SIZE; i++) {
-        rd = xorshift64(rd);
-        param_corrent_data[i] = (int8_t)(rd % 256);
+uint8_t keep_msb_bitops(uint8_t x) {
+    if (x == 0) {
+        return 0;
     }
-}
-
-void swap(int8_t** a, int8_t** b) {
-    int8_t* tmp = *a;
-    *a = *b;
-    *b = tmp;
-}
-
-result_t readfile(char* dst, const char* path) {
-    FILE* fp = fopen(path, "r");
-    if (!fp) {
-        fprintf(stderr, "Failed to open source file: %s\n", path);
-        return RESULT_ERR;
-    }
-    fseek(fp, 0, SEEK_END);
-    size_t size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    fread(dst, 1, size, fp);
-    fclose(fp);
-    return RESULT_OK;
-}
-
-void cal() {
-    int param_i = 0;
-    for (int layer2_i = 0; layer2_i < LAYER_SIZE; layer2_i++) {
-        layer2[layer2_i] = 0;
-        for (int layer1_i = 0; layer1_i < LAYER_SIZE; layer1_i++) {
-            layer2[layer2_i] += layer1[layer1_i] * param_corrent_data[param_i++];
-        }
-        layer2[layer2_i] += param_corrent_data[param_i++];
-        layer2[layer2_i] = (layer2[layer2_i] > 0) ? layer2[layer2_i] : 0;
-    }
-    swap(&layer1, &layer2);
+    x = x | (x >>  1);
+    x = x | (x >>  2);
+    x = x | (x >>  4);
+    return x ^ (x >> 1);
 }
 
 void layer_clean() {
-    memset(layer1, 0, LAYER_SIZE);
+    memset(layer1_u8, 0, LAYER_BITSIZE / 8);
 }
 
-void layer_write(char ch) {
-    memset(layer1, 0, 256);
-    layer1[ch] = 1;
+void layer_write(uint8_t index) {
+    memset(layer1_u8, 0, IO_BYTESIZE);
+    layer1_u8[index] = UINT8_MAX;
 }
 
-char layer_read() {
-    int8_t max = -128;
-    int8_t out = -128;
+uint8_t layer_read(uint8_t index) {
+    uint8_t max_value = 0;
+    uint8_t max_index = 0;
     for (int i = 0; i < 256; i++) {
-        if (layer1[i] > max) {
-            max = layer1[i];
-            out = i - 128;
+        if (layer1_u8[i] > max_value) {
+            max_value = layer1_u8[i];
+            max_index = i;
         }
     }
-    return out;
+    return max_index;
 }
 
-int64_t score(int8_t correct_index) {
+void layer_cal() {
+    int param_i = 0;
+    for (int output_i = 0; output_i < LAYER_BITSIZE / 8; output_i++) {
+        int64_t x = 0;
+        for (int input_i = 0; input_i < LAYER_BITSIZE / 64; input_i++) {
+            x += __builtin_popcountll(layer1_u64[input_i] & param[param_i++]);
+            x -= __builtin_popcountll(layer1_u64[input_i] & param[param_i++]);
+        }
+        x = keep_msb_bitops(x);
+        layer2_u8[output_i] = x;
+    }
+    uint64_t* tmp = layer1_u64;
+    layer1_u64 = layer2_u64;
+    layer2_u64 = tmp;
+}
+
+int64_t score(uint8_t correct_ch) {
     int64_t score = 0;
-    if(layer_read() == correct_index) {
-        score += 65536;
+    for (int i = 0; i < LAYER_BITSIZE / 8; i++) {
+        score -= ((uint8_t*)layer1_u8)[i];
     }
-    for (int i = 0; i < 256; i++) {
-        int8_t a = layer1[i];
-        score -= (a < 0) ? -a : a;
-    }
+    score += layer1_u8[correct_ch] * 256;
     return score;
-}
-
-result_t train() {
-    int64_t best_score = INT64_MIN;
-    for (int train_i = 0; train_i < TRAIN_COUNT; train_i++) {
-        int64_t corrent_score = 0;
-        memcpy(param_corrent_data, param_best_data, PARAM_SIZE);
-        param_randomize();
-        layer_clean();
-        for (char* train_itr = train_data; *train_itr != '\0'; train_itr++) {
-            char ch_in = *train_itr;
-            char ch_correct = *(train_itr+1);
-            layer_write(ch_in);
-            cal();
-            putchar(layer_read());
-            corrent_score += score(ch_correct);
-        }
-        if (corrent_score > best_score) {
-            best_score = corrent_score;
-            memcpy(param_best_data, param_corrent_data, PARAM_SIZE);
-            printf("New best score: %lld\n", best_score);
-        } else {
-            printf("Score did not improve: %lld\n", corrent_score);
-        }
-    }
-    return RESULT_OK;
-}
-
-result_t gen() {
-    memcpy(param_corrent_data, param_best_data, PARAM_SIZE);
-    layer_clean();
-    for (char* io_itr = io_data; *io_itr != '\0'; io_itr++) {
-        char ch = *io_itr;
-        layer_write(ch);
-        cal();
-    }
-    for (int i = 0; i < GEN_COUNT; i++) {
-        memset(layer1, 0, 256);
-        cal();
-        int ch = layer_read();
-        printf("Generated char: %d\n", ch);
-    }
-}
-
-int main() {
-    if (readfile(train_data, "./train.txt") != RESULT_OK) {
-        return 1;
-    }
-    if (readfile(io_data, "./input.txt") != RESULT_OK) {
-        return 1;
-    }
-    if (train() != RESULT_OK) {
-        return 1;
-    }
-    if (gen() != RESULT_OK) {
-        return 1;
-    }
-    return 0;
 }
