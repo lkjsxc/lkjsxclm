@@ -69,7 +69,7 @@ void layer_cal() {
 int64_t score(uint8_t correct_ch) {
     int64_t score = 0;
     for (int i = 0; i < LAYER_BITSIZE / 8; i++) {
-        score -= ((uint8_t*)layer1_u8)[i];
+        score -= layer1_u8[i];
     }
     score += layer1_u8[correct_ch] * 256;
     return score;
