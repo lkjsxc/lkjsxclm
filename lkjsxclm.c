@@ -30,16 +30,6 @@ uint64_t xorshift64(uint64_t x) {
     return x;
 }
 
-uint8_t keep_msb_bitops(uint8_t x) {
-    if (x == 0) {
-        return 0;
-    }
-    x = x | (x >>  1);
-    x = x | (x >>  2);
-    x = x | (x >>  4);
-    return x ^ (x >> 1);
-}
-
 void layer_clean() {
     memset(layer1_u8, 0, LAYER_BITSIZE / 8);
 }
@@ -66,10 +56,9 @@ void layer_cal() {
     for (int output_i = 0; output_i < LAYER_BITSIZE / 8; output_i++) {
         int64_t x = 0;
         for (int input_i = 0; input_i < LAYER_BITSIZE / 64; input_i++) {
-            x += __builtin_popcountll(layer1_u64[input_i] & param[param_i++]);
-            x -= __builtin_popcountll(layer1_u64[input_i] & param[param_i++]);
+            x += layer1_u64[input_i] & param[param_i++];
+            x -= layer1_u64[input_i] & param[param_i++];
         }
-        x = keep_msb_bitops(x);
         layer2_u8[output_i] = x;
     }
     uint64_t* tmp = layer1_u64;
