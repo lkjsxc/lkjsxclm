@@ -3,16 +3,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define IO_BYTESIZE 256
+#define LAYERIO_BYTESIZE 256
 #define MEMORY_BYTESIZE 256
-#define LAYER_BITSIZE ((IO_BYTESIZE + MEMORY_BYTESIZE) * 8)
-#define PARAM_BITSIZE (LAYER_BITSIZE * LAYER_BITSIZE * 2)
-#define TRAIN_BITSIZE (1024 * 1024 * 8)
+#define TEXT_BITSIZE (1024 * 1024 * 8)
+#define MUTATION_RATE 0.0004
 #define RANDOM_SEED 1
 
+#define LAYER_BITSIZE ((LAYERIO_BYTESIZE + MEMORY_BYTESIZE) * 8)
+#define PARAM_BITSIZE (LAYER_BITSIZE * LAYER_BITSIZE * 2)
+
 uint64_t best_param[PARAM_BITSIZE / 64];
-uint8_t train1[TRAIN_BITSIZE / 8];
-uint8_t train2[TRAIN_BITSIZE / 8];
+uint8_t text_train[TEXT_BITSIZE / 8];
+uint8_t text_input[TEXT_BITSIZE / 8];
+uint8_t text_output[TEXT_BITSIZE / 8];
 int64_t best_score = 0;
 
 uint64_t param[PARAM_BITSIZE / 64];
@@ -34,12 +37,12 @@ void layer_clean() {
     memset(layer1_u8, 0, LAYER_BITSIZE / 8);
 }
 
-void layer_write(uint8_t index) {
-    memset(layer1_u8, 0, IO_BYTESIZE);
+void layer_setchar(uint8_t index) {
+    memset(layer1_u8, 0, LAYERIO_BYTESIZE);
     layer1_u8[index] = UINT8_MAX;
 }
 
-uint8_t layer_read(uint8_t index) {
+uint8_t layer_getchar(uint8_t index) {
     uint8_t max_value = 0;
     uint8_t max_index = 0;
     for (int i = 0; i < 256; i++) {
@@ -49,6 +52,15 @@ uint8_t layer_read(uint8_t index) {
         }
     }
     return max_index;
+}
+
+int64_t layer_score(uint8_t correct_ch) {
+    int64_t score = LAYER_BITSIZE / 8 * 256;
+    for (int i = 0; i < LAYER_BITSIZE / 8; i++) {
+        score -= layer1_u8[i];
+    }
+    score += layer1_u8[correct_ch] * 256;
+    return score;
 }
 
 void layer_cal() {
@@ -66,11 +78,21 @@ void layer_cal() {
     layer2_u64 = tmp;
 }
 
-int64_t score(uint8_t correct_ch) {
-    int64_t score = 0;
-    for (int i = 0; i < LAYER_BITSIZE / 8; i++) {
-        score -= layer1_u8[i];
+void param_init() {
+    for (int i = 0; i < PARAM_BITSIZE / 64; i++) {
+        rd = xorshift64(rd);
+        param[i] = rd;
     }
-    score += layer1_u8[correct_ch] * 256;
-    return score;
+}
+
+void param_mutate() {
+    for (int i = 0; i < PARAM_BITSIZE / 64; i++) {
+        rd = xorshift64(rd);
+        uint64_t rd1 = rd;
+        xorshift64(rd1);
+        uint64_t rd2 = rd;
+        if (rd1 >= (UINT64_MAX * MUTATION_RATE)) {
+            param[i] = rd2;
+        }
+    }
 }
