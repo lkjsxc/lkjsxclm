@@ -10,21 +10,21 @@
 #define LAYERIO_BYTESIZE 256
 #define MEMORY_BYTESIZE 256
 #define MUTATION_RATE 0.0004
-#define THREAD_COUNT 12
+#define THREAD_COUNT 14
 #define TRAIN_COUNT 10000
 #define OUTPUT_COUNT 1000
 #define RANDOM_SEED 123
 
-#define TEXT_BITSIZE (1024 * 1024 * 8)
+#define TEXT_BYTESIZE (1024 * 1024)
 #define TRAIN_PATH "./train.txt"
 #define INPUT_PATH "./input.txt"
 #define OUTPUT_PATH "./output.txt"
 
 #define LAYER_BYTESIZE (LAYERIO_BYTESIZE + MEMORY_BYTESIZE)
-#define LAYER_BITSIZE (LAYER_BYTESIZE * 8)
+#define PARAM_BYTESIZE (LAYER_BYTESIZE * LAYER_BYTESIZE * 2)
 
-#define PARAM_BITSIZE (LAYER_BITSIZE * LAYER_BITSIZE * 2)
-#define PARAM_BYTESIZE (PARAM_BITSIZE / 8)
+#define LAYER_BITSIZE (LAYER_BYTESIZE * 8)
+#define PARAM_BITSIZE (PARAM_BYTESIZE * 8)
 
 typedef union {
     int64_t i64;
@@ -35,27 +35,25 @@ typedef union {
 
 uint64_t best_param[PARAM_BYTESIZE / sizeof(uint64_t)];
 int64_t best_score = INT64_MIN;
-pthread_mutex_t best_param_mutex;
 
-uint8_t train_data[TEXT_BITSIZE / 8];
-uint8_t input_data[TEXT_BITSIZE / 8];
-uint8_t output_data[TEXT_BITSIZE / 8];
+uint8_t train_data[TEXT_BYTESIZE];
+uint8_t input_data[TEXT_BYTESIZE];
+uint8_t output_data[TEXT_BYTESIZE];
 
 int64_t train_size;
 int64_t input_size;
 volatile int global_iterations = 0;
-pthread_mutex_t print_mutex;
 
 typedef struct {
     int id;
-    uint64_t local_param[PARAM_BYTESIZE / sizeof(uint64_t)];
-
-    uint64_t layer_data[LAYER_BITSIZE / 64 * 2];
     uint64_t* layer1_u64;
     uint64_t* layer2_u64;
     uint8_t* layer1_u8;
     uint8_t* layer2_u8;
+    int8_t* param_i8;
     uint64_t rd;
+    uint64_t layer_data[LAYER_BYTESIZE / sizeof(uint64_t) * 2];
+    uint64_t param_u64[PARAM_BYTESIZE / sizeof(uint64_t)];
 } thread_data_t;
 
 thread_data_t thread_data[THREAD_COUNT];
@@ -76,9 +74,9 @@ size_t file_read(uint8_t* dst, const char* filename) {
     }
     fseek(fp, 0, SEEK_END);
     size_t n = ftell(fp);
-    if (n >= TEXT_BITSIZE / 8) {
-        fprintf(stderr, "Warning: File %s exceeds buffer size (%d bytes). Truncating.\n", filename, TEXT_BITSIZE / 8);
-        n = TEXT_BITSIZE / 8 - 1;
+    if (n >= TEXT_BYTESIZE) {
+        fprintf(stderr, "Warning: File %s exceeds buffer size (%d bytes). Truncating.\n", filename, TEXT_BYTESIZE);
+        n = TEXT_BYTESIZE - 1;
     }
     fseek(fp, 0, SEEK_SET);
     size_t read_count = fread(dst, 1, n, fp);
@@ -113,12 +111,12 @@ size_t file_write(const uint8_t* src, size_t size, const char* filename) {
     return written_count;
 }
 
-void layer_clean(thread_data_t* td) {
-    memset(td->layer1_u8, 0, LAYERIO_BYTESIZE);
-}
-
 void layer_reset(thread_data_t* td) {
     memset(td->layer_data, 0, sizeof(td->layer_data));
+}
+
+void layer_clean(thread_data_t* td) {
+    memset(td->layer1_u8, 0, LAYERIO_BYTESIZE);
 }
 
 void layer_setchar(thread_data_t* td, uint8_t index) {
@@ -163,19 +161,22 @@ int64_t layer_score(thread_data_t* td, uint8_t correct_ch) {
     return score;
 }
 
-void layer_cal(thread_data_t* td, const uint64_t* current_param) {
+void layer_cal(thread_data_t* td) {
     int param_i = 0;
     for (int dst_i = 0; dst_i < LAYER_BYTESIZE; dst_i++) {
-        int64_t sum = ((int8_t*)td->local_param)[param_i++];
+        int64_t sum = td->param_i8[param_i++];
         for (int src_i = 0; src_i < LAYER_BYTESIZE; src_i++) {
-            sum += td->layer1_u8[src_i] * ((int8_t*)td->local_param)[param_i++];
+            sum += td->layer1_u8[src_i] * td->param_i8[param_i++];
         }
-        sum /= LAYER_BYTESIZE * LAYER_BYTESIZE / 128;
-        if(sum < 0) {
+        sum /= 2048;
+        if (sum < 0) {
             sum = 0;
-        } else if(sum > UINT8_MAX) {
+        } else if (sum > UINT8_MAX) {
             sum = UINT8_MAX;
         }
+        sum |= sum >> 4;
+        sum |= sum >> 2;
+        sum |= sum >> 1;
         td->layer2_u8[dst_i] = sum;
     }
 
@@ -205,16 +206,15 @@ void param_init(uint64_t seed) {
         thread_data[i].layer2_u64 = thread_data[i].layer_data + (LAYER_BITSIZE / 64);
         thread_data[i].layer1_u8 = (uint8_t*)(thread_data[i].layer1_u64);
         thread_data[i].layer2_u8 = (uint8_t*)(thread_data[i].layer2_u64);
-
-        current_rd = xorshift64(current_rd);
-        thread_data[i].rd = current_rd ? current_rd : 1;
+        thread_data[i].param_i8 = (int8_t*)(thread_data[i].param_u64);
+        thread_data[i].rd = RANDOM_SEED + thread_data[i].id;
     }
     printf("Thread data initialized.\n");
 }
 
 void param_mutate(thread_data_t* td) {
     pthread_mutex_lock(&best_param_mutex);
-    memcpy(td->local_param, best_param, sizeof(best_param));
+    memcpy(td->param_u64, best_param, sizeof(best_param));
     pthread_mutex_unlock(&best_param_mutex);
 
     int mutations = 0;
@@ -228,7 +228,7 @@ void param_mutate(thread_data_t* td) {
         td->rd = xorshift64(td->rd);
         if (td->rd < threshold) {
             td->rd = xorshift64(td->rd);
-            td->local_param[i] = td->rd;
+            td->param_u64[i] = td->rd;
             mutations++;
         }
     }
@@ -242,15 +242,12 @@ int64_t evaluate(thread_data_t* td, const uint64_t* current_param) {
 
     layer_reset(td);
 
-    if (train_size < 2)
-        return INT64_MIN;
-
     for (int64_t i = 0; i < train_size / 2; i++) {
         ch_in = train_data[i];
         ch_correct = train_data[i + 1];
 
         layer_setchar(td, ch_in);
-        layer_cal(td, current_param);
+        layer_cal(td);
 
         current_total_score += layer_score(td, ch_correct);
 
@@ -260,17 +257,11 @@ int64_t evaluate(thread_data_t* td, const uint64_t* current_param) {
         }
     }
 
-    if (train_size >= 2) {
-        ch_in = layer_getchar(td);
-    } else {
-        return current_total_score;
-    }
-
     for (int64_t i = train_size / 2; i < train_size - 1; i++) {
         ch_correct = train_data[i + 1];
 
         layer_setchar(td, ch_in);
-        layer_cal(td, current_param);
+        layer_cal(td);
         ch_out = layer_getchar(td);
 
         current_total_score += layer_score(td, ch_correct);
