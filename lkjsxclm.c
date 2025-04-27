@@ -15,16 +15,13 @@
 #define OUTPUT_COUNT 1000
 #define RANDOM_SEED 123
 
-#define TEXT_BYTESIZE (1024 * 1024)
+#define TEXT_BYTESIZE (1024 * 1024 * 16)
 #define TRAIN_PATH "./train.txt"
 #define INPUT_PATH "./input.txt"
 #define OUTPUT_PATH "./output.txt"
 
 #define LAYER_BYTESIZE (LAYERIO_BYTESIZE + MEMORY_BYTESIZE)
 #define PARAM_BYTESIZE (LAYER_BYTESIZE * LAYER_BYTESIZE * 2)
-
-#define LAYER_BITSIZE (LAYER_BYTESIZE * 8)
-#define PARAM_BITSIZE (PARAM_BYTESIZE * 8)
 
 typedef union {
     int64_t i64;
@@ -33,32 +30,31 @@ typedef union {
     int8_t i8[8];
 } uni64_t;
 
-uint64_t best_param[PARAM_BYTESIZE / sizeof(uint64_t)];
-int64_t best_score = INT64_MIN;
-pthread_mutex_t best_param_mutex;
-
-uint8_t train_data[TEXT_BYTESIZE];
-uint8_t input_data[TEXT_BYTESIZE];
-uint8_t output_data[TEXT_BYTESIZE];
-
-int64_t train_size;
-int64_t input_size;
-volatile int global_iterations = 0;
-pthread_mutex_t print_mutex;
-
 typedef struct {
-    int id;
+    int64_t tid;
     uint64_t* layer1_u64;
     uint64_t* layer2_u64;
     uint8_t* layer1_u8;
     uint8_t* layer2_u8;
     int8_t* param_i8;
     uint64_t rd;
+    int64_t best_score;
     uint64_t layer_data[LAYER_BYTESIZE / sizeof(uint64_t) * 2];
     uint64_t param_u64[PARAM_BYTESIZE / sizeof(uint64_t)];
-} thread_data_t;
+    uint64_t best_param[PARAM_BYTESIZE / sizeof(uint64_t)];
+} thread_t;
 
-thread_data_t thread_data[THREAD_COUNT];
+typedef struct {
+    thread_t* best_thread;
+    int64_t train_size;
+    int64_t input_size;
+    uint8_t train_data[TEXT_BYTESIZE];
+    uint8_t input_data[TEXT_BYTESIZE];
+    uint8_t output_data[TEXT_BYTESIZE];
+} global_t;
+
+thread_t thread_data[THREAD_COUNT];
+global_t global_data;
 
 uint64_t xorshift64(uint64_t x) {
     x ^= x << 13;
@@ -113,15 +109,15 @@ size_t file_write(const uint8_t* src, size_t size, const char* filename) {
     return written_count;
 }
 
-void layer_reset(thread_data_t* td) {
+void layer_reset(thread_t* td) {
     memset(td->layer_data, 0, sizeof(td->layer_data));
 }
 
-void layer_clean(thread_data_t* td) {
+void layer_clean(thread_t* td) {
     memset(td->layer1_u8, 0, LAYERIO_BYTESIZE);
 }
 
-void layer_setchar(thread_data_t* td, uint8_t index) {
+void layer_setchar(thread_t* td, uint8_t index) {
     memset(td->layer1_u8, 0, LAYERIO_BYTESIZE);
     if (index < LAYERIO_BYTESIZE) {
         td->layer1_u8[index] = UINT8_MAX;
@@ -131,7 +127,7 @@ void layer_setchar(thread_data_t* td, uint8_t index) {
     }
 }
 
-uint8_t layer_getchar(thread_data_t* td) {
+uint8_t layer_getchar(thread_t* td) {
     uint8_t max_value = 0;
     uint8_t max_index = 0;
 
@@ -145,7 +141,7 @@ uint8_t layer_getchar(thread_data_t* td) {
     return max_index;
 }
 
-int64_t layer_score(thread_data_t* td, uint8_t correct_ch) {
+int64_t layer_score(thread_t* td, uint8_t correct_ch) {
     int64_t score = 0;
     const int64_t correct_bonus_multiplier = LAYERIO_BYTESIZE / 32;
     const int64_t perfect_match_bonus = LAYERIO_BYTESIZE * UINT8_MAX / 32;
@@ -163,7 +159,7 @@ int64_t layer_score(thread_data_t* td, uint8_t correct_ch) {
     return score;
 }
 
-void layer_cal(thread_data_t* td) {
+void layer_cal(thread_t* td) {
     int param_i = 0;
     for (int dst_i = 0; dst_i < LAYER_BYTESIZE; dst_i++) {
         int64_t sum = td->param_i8[param_i++];
@@ -191,52 +187,25 @@ void layer_cal(thread_data_t* td) {
     td->layer2_u8 = tmp_u8;
 }
 
-void param_init(uint64_t seed) {
-    uint64_t current_rd = seed;
-    printf("Initializing global best parameters with seed %llu...\n", (unsigned long long)seed);
-    for (int i = 0; i < PARAM_BYTESIZE / sizeof(uint64_t); i++) {
-        current_rd = xorshift64(current_rd);
-        best_param[i] = current_rd;
+void param_mutate(thread_t* td) {
+    if(global_data.best_thread->best_score > td->best_score) {
     }
-    printf("Global parameters initialized.\n");
 
-    printf("Initializing thread-local data...\n");
-    for (int i = 0; i < THREAD_COUNT; ++i) {
-        thread_data[i].id = i;
+    memcpy(td->param_u64, td->best_param, PARAM_BYTESIZE);
 
-        thread_data[i].layer1_u64 = thread_data[i].layer_data;
-        thread_data[i].layer2_u64 = thread_data[i].layer_data + (LAYER_BITSIZE / 64);
-        thread_data[i].layer1_u8 = (uint8_t*)(thread_data[i].layer1_u64);
-        thread_data[i].layer2_u8 = (uint8_t*)(thread_data[i].layer2_u64);
-        thread_data[i].param_i8 = (int8_t*)(thread_data[i].param_u64);
-        thread_data[i].rd = RANDOM_SEED + thread_data[i].id;
-    }
-    printf("Thread data initialized.\n");
-}
-
-void param_mutate(thread_data_t* td) {
-    pthread_mutex_lock(&best_param_mutex);
-    memcpy(td->param_u64, best_param, sizeof(best_param));
-    pthread_mutex_unlock(&best_param_mutex);
-
-    int mutations = 0;
-
-    uint64_t threshold = (uint64_t)(UINT64_MAX * MUTATION_RATE);
-    if (threshold == 0 && MUTATION_RATE > 0.0) {
-        threshold = 1;
-    }
+    td->rd = xorshift64(td->rd);
+    uint64_t mutation_rate = td->rd % (uint64_t)(UINT64_MAX * MUTATION_RATE);
 
     for (int i = 0; i < PARAM_BYTESIZE / sizeof(uint64_t); i++) {
         td->rd = xorshift64(td->rd);
-        if (td->rd < threshold) {
+        if (td->rd < mutation_rate) {
             td->rd = xorshift64(td->rd);
             td->param_u64[i] = td->rd;
-            mutations++;
         }
     }
 }
 
-int64_t evaluate(thread_data_t* td, const uint64_t* current_param) {
+int64_t evaluate(thread_t* td) {
     int64_t current_total_score = 0;
     uint8_t ch_out;
     uint8_t ch_in;
@@ -244,9 +213,9 @@ int64_t evaluate(thread_data_t* td, const uint64_t* current_param) {
 
     layer_reset(td);
 
-    for (int64_t i = 0; i < train_size / 2; i++) {
-        ch_in = train_data[i];
-        ch_correct = train_data[i + 1];
+    for (int64_t i = 0; i < global_data.train_size / 2; i++) {
+        ch_in = global_data.train_data[i];
+        ch_correct = global_data.train_data[i + 1];
 
         layer_setchar(td, ch_in);
         layer_cal(td);
@@ -259,8 +228,8 @@ int64_t evaluate(thread_data_t* td, const uint64_t* current_param) {
         }
     }
 
-    for (int64_t i = train_size / 2; i < train_size - 1; i++) {
-        ch_correct = train_data[i + 1];
+    for (int64_t i = global_data.train_size / 2; i < global_data.train_size - 1; i++) {
+        ch_correct = global_data.train_data[i + 1];
 
         layer_setchar(td, ch_in);
         layer_cal(td);
@@ -275,4 +244,24 @@ int64_t evaluate(thread_data_t* td, const uint64_t* current_param) {
     }
 
     return current_total_score;
+}
+
+void init() {
+    uint64_t rd = RANDOM_SEED;
+    printf("Initializing global best parameters with seed %llu...\n", (unsigned long long)rd);
+    global_data.best_thread = &thread_data[0];
+    global_data.best_thread->best_score = INT64_MIN;
+    printf("Global parameters initialized.\n");
+
+    printf("Initializing thread-local data...\n");
+    for (int i = 0; i < THREAD_COUNT; ++i) {
+        thread_data[i].tid = i;
+        thread_data[i].layer1_u64 = thread_data[i].layer_data;
+        thread_data[i].layer2_u64 = thread_data[i].layer_data + LAYER_BYTESIZE / sizeof(uint64_t);
+        thread_data[i].layer1_u8 = (uint8_t*)(thread_data[i].layer1_u64);
+        thread_data[i].layer2_u8 = (uint8_t*)(thread_data[i].layer2_u64);
+        thread_data[i].param_i8 = (int8_t*)(thread_data[i].param_u64);
+        thread_data[i].rd = RANDOM_SEED + thread_data[i].tid;
+    }
+    printf("Thread data initialized.\n");
 }
