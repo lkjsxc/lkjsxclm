@@ -35,6 +35,7 @@ typedef union {
 
 uint64_t best_param[PARAM_BYTESIZE / sizeof(uint64_t)];
 int64_t best_score = INT64_MIN;
+pthread_mutex_t best_param_mutex;
 
 uint8_t train_data[TEXT_BYTESIZE];
 uint8_t input_data[TEXT_BYTESIZE];
@@ -43,6 +44,7 @@ uint8_t output_data[TEXT_BYTESIZE];
 int64_t train_size;
 int64_t input_size;
 volatile int global_iterations = 0;
+pthread_mutex_t print_mutex;
 
 typedef struct {
     int id;
